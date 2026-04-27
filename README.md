@@ -1,3 +1,3 @@
-# Simon Accelerometer/Drone
+# RX Drone
 
-Simon Accelerometer code - will be used as the skeleton for implementing basic motor actuation.
+RX Implementation code - will be used as to verify RX/TX communication is successful. 
