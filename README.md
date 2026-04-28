@@ -1,3 +1,3 @@
 # RX Drone
 
-RX Implementation code - will be used as to verify RX/TX communication is successful. 
+RX Implementation code - will be used to verify RX/TX communication is successful. 
