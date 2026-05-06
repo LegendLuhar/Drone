@@ -1,0 +1,79 @@
+Drone PWM Visualization Writeup - Rahul Kishore, Richard Bosch
+
+Project overview
+
+This project repurposes the Simon PCB as a drone motor thrust visualizer.
+The LIS2HH12 accelerometer reads board tilt and maps pitch/roll to four
+independent LED brightness levels, mimicking how a quadcopter flight
+controller adjusts motor PWM to stay level.
+
+Core behavior
+
+- four APA102 LEDs represent four drone motors in an X-configuration.
+- each LED brightness is an independent PWM duty cycle (0-255).
+- tilting the board so a motor position dips increases that LED brightness
+  (simulating increased thrust to compensate).
+- tilting the board so a motor position raises decreases that LED brightness
+  (simulating reduced thrust on the high side).
+- all four LEDs update simultaneously every tick (~10 ms).
+
+Smooth PWM
+
+- two-stage IIR low-pass filtering ensures glitch-free transitions:
+  1. axis filter on raw accelerometer X/Y readings (coefficient 4).
+  2. output blend filter on computed PWM duty values (coefficient 3).
+- a small deadband around center prevents jitter when the board is flat.
+
+Startup sequence
+
+- board powers on and accelerometer initializes over SPI1.
+- calibration phase (~320 ms): all LEDs show dim white while the flat-resting
+  zero offset is measured from 32 samples.
+- running phase: LEDs respond to tilt in real time with base brightness at
+  mid-throttle (128/255).
+
+Motor layout (top-down view)
+
+    LED0 [Front-Left]     LED1 [Front-Right]
+         \                /
+          \   [PCB]      /
+           ------------
+          /            \
+         /              \
+    LED2 [Rear-Left]    LED3 [Rear-Right]
+
+Pitch axis (X): board tips forward -> front motors brighten, rear motors dim.
+Roll  axis (Y): board tips right   -> right motors brighten, left motors dim.
+
+Fault handling
+
+- if the accelerometer read fails, all four LEDs show a diagnostic color:
+  - red:    WHO_AM_I register mismatch.
+  - orange: config write failure.
+  - green:  config read failure.
+  - blue:   sample read failure.
+- recovers automatically when valid readings resume.
+
+Architecture
+
+- simon.c: startup and main loop (init hardware, run DroneUpdate each tick,
+  push LED frame over SPI).
+- drone_control.c/.h: accelerometer sampling, axis filtering, motor mixing,
+  output blending, frame rendering, fault handling.
+- colors.c/.h: leds_off constant, BuildDroneFrame (per-motor brightness),
+  BuildUniformFrame (error/status display).
+- accelerometer.c/.h: LIS2HH12 SPI driver, WHO_AM_I probe, config, per-axis reads.
+- timing.c/.h: periodic TIMG0 interrupt for ~10 ms game tick.
+- buttons.c/.h: GPIO input initialization.
+- leds.c/.h: SPI0 APA102 LED chain driver.
+- delay.c/.h: cycle-accurate busy-wait utility.
+
+Tunable parameters (drone_control.h)
+
+- HOVER_DUTY: base brightness at level (default 128).
+- TILT_SCALE: divisor mapping accel counts to PWM offset (default 32).
+- DEAD_BAND: center deadzone to suppress jitter (default 2).
+- AXIS_FILTER_COEFF: IIR smoothing on accelerometer axes (default 4).
+- OUTPUT_BLEND_COEFF: IIR smoothing on PWM outputs (default 3).
+- FRAME_BRIGHTNESS: APA102 global brightness field (default 14).
+- CALIBRATION_CYCLES: samples collected for zero-offset calibration (default 32).

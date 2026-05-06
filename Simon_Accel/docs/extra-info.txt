@@ -1,0 +1,67 @@
+Simon PCB RGB LED → SPI Frame Mapping Report
+A) Evidence Section
+LED refdes and part: simon_io.kicad_sch defines LED1, LED2, LED3, LED4 as ELEC327-Kicad:BL-HBGR32L-3-TRB-8 (Value: SK9822), APA102-style chainable LEDs.
+LED symbol pinout: simon_io.kicad_sch lines 136–224: Pin 1=DIN, Pin 2=CIN, Pin 6=DOUT, Pin 5=COUT.
+Chain connectivity (PCB nets): Simon-2026-JLC.kicad_pcb:
+LED1: DIN=SPI0_LED_PICO (net 24), CIN=SPI0_LED_SCK (net 23), DOUT=Net-(LED1-DOUT) (net 26), COUT=Net-(LED1-COUT) (net 25)
+LED2: DIN=Net-(LED1-DOUT), CIN=Net-(LED1-COUT), DOUT=Net-(LED2-DOUT), COUT=Net-(LED2-COUT)
+LED3: DIN=Net-(LED2-DOUT), CIN=Net-(LED2-COUT), DOUT=Net-(LED3-DOUT), COUT=Net-(LED3-COUT)
+LED4: DIN=Net-(LED3-DOUT), CIN=Net-(LED3-COUT), COUT/DOUT unconnected
+SPI nets: simon_io.kicad_sch lines 1223, 1333: SPI0_LED_SCK, SPI0_LED_PICO (MOSI).
+MCU SPI pins: leds.c lines 35–36: PA11=SPI0_SCLK, PA9=SPI0_PICO; Simon-2026-JLC.kicad_pcb nets 23 (SPI0_LED_SCK), 24 (SPI0_LED_PICO).
+PCB positions (from Simon-2026-JLC.kicad_pcb):
+LED1: (95, 80), LED2: (95, 55), LED3: (70, 55), LED4: (70, 80)
+SW1: (107, 93), SW2: (107, 42), SW3: (58, 42), SW4: (58, 93)
+Button nets: Simon-2026-JLC.kicad_pcb nets 15–18: SW1→BUTTON1_IO, SW2→BUTTON2_IO, SW3→BUTTON3_IO, SW4→BUTTON4_IO.
+Color order: BL-HBGR32L uses BGR (Blue–Green–Red) per part name and LCSC/BRTLED documentation.
+Firmware encoding: state_machine.c lines 62–97: 16-bit words packed as [brightness|B][G|R]; BGR order matches BL-HBGR32L.
+B) Mapping Tables
+1. Chain Order Table
+Frame index	LED refdes	DIN net	DOUT net	PCB position (mm)
+1	LED1	SPI0_LED_PICO (MCU)	Net-(LED1-DOUT)	(95, 80) upper-right
+2	LED2	Net-(LED1-DOUT)	Net-(LED2-DOUT)	(95, 55) right-center
+3	LED3	Net-(LED2-DOUT)	Net-(LED3-DOUT)	(70, 55) left-center
+4	LED4	Net-(LED3-DOUT)	unconnected	(70, 80) upper-left
+2. Button-to-LED Table
+Button	Button net	Nearest LED refdes	Reason/evidence
+SW1	BUTTON1_IO	LED1	SW1 (107,93) and LED1 (95,80) both upper-right; shortest distance
+SW2	BUTTON2_IO	LED2	SW2 (107,42) and LED2 (95,55) both right side
+SW3	BUTTON3_IO	LED3	SW3 (58,42) and LED3 (70,55) both left side
+SW4	BUTTON4_IO	LED4	SW4 (58,93) and LED4 (70,80) both upper-left
+C) Firmware Guidance
+LED slot order
+Use this mapping for packet generation:
+
+Button (index)	Nearest LED	Chain frame index	Firmware slot (0–3)
+SW1 (0)	LED1	1	slot 0
+SW2 (1)	LED2	2	slot 1
+SW3 (2)	LED3	3	slot 2
+SW4 (3)	LED4	4	slot 3
+Example packet assignment
+Current state_machine.c mapping is correct:
+
+g_led_message_sw1 → slot 0 (LED1) – SW1 green
+g_led_message_sw2 → slot 1 (LED2) – SW2 red
+g_led_message_sw3 → slot 2 (LED3) – SW3 yellow
+g_led_message_sw4 → slot 3 (LED4) – SW4 blue
+Color and brightness
+Channel order: BGR. Each 32-bit frame: [111 + 5-bit brightness][B][G][R].
+16-bit packing (MSB first): word0 = (brightness<<8)|B, word1 = (G<<8)|R.
+Brightness: 5 bits (0–31). 0xE0 = 111 + brightness 0; 0xE5 = 111 + brightness 5.
+Current firmware encoding matches BGR and brightness format.
+D) Confidence
+Mapping row	Confidence	Notes
+Chain order LED1→2→3→4	100	PCB netlist is explicit
+SW1→LED1	95	Proximity; no other LED closer
+SW2→LED2	95	Same
+SW3→LED3	95	Same
+SW4→LED4	95	Same
+BGR color order	90	Part name and vendor docs; not from datasheet
+Unresolved items
+BL-HBGR32L vs SK9822: Schematic uses SK9822 as value; footprint is BL-HBGR32L. If the actual part differs, color order may need adjustment.
+If LEDs still look wrong: Check button_masks order in state_machine.c vs buttons.h (SW1=bit 23, SW2=24, SW3=25, SW4=26) and confirm stable_pressed index order matches the intended physical buttons.
+Summary
+Chain: MCU → LED1 → LED2 → LED3 → LED4 (frame 1–4).
+Button→LED: SW1→LED1, SW2→LED2, SW3→LED3, SW4→LED4.
+Firmware: Slot 0–3 already map to LED1–4; BGR encoding is correct.
+If the wrong LED lights for a button, the issue is likely in button GPIO/bit mapping or debounce logic, not in the LED chain or slot assignment.
