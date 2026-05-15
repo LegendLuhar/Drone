@@ -54,8 +54,19 @@ void dshot_set_all_motor_stop(void);
 /* Kick off transmission of the staged frames on all four motors.
  * Call from a periodic task at 1..8 kHz. Returns false if a previous frame
  * is still in flight (DMA not done yet) — in that case the caller should
- * skip and try again next tick. */
+ * skip and try again next tick.
+ *
+ * Internally this flips the four motor pins from GPIO-output-LOW back to
+ * timer-driven before arming the DMA, so the ESC sees a rising edge at
+ * frame start instead of staying HIGH the whole inter-frame gap. */
 bool dshot_transmit(void);
+
+/* Park the motor pins LOW between frames. Call from the scheduler tick
+ * *after* dshot_transmit() — typically 100 µs later for the existing
+ * 10 kHz / 1 kHz-frame layout. Switches each PINCM back to GPIO so the
+ * line idles LOW for the remaining ~900 µs of inter-frame gap (the ESC's
+ * frame-alignment cue). */
+void dshot_park(void);
 
 /* Diagnostics for SWD. Read these over the debugger to verify activity. */
 extern volatile uint32_t dshot_frames_started;

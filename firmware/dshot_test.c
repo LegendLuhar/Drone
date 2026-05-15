@@ -7,18 +7,17 @@
  *   - After the arm hold, all four motors are commanded to SPIN_THROTTLE
  *     and stay there until power-off.
  *
- * SAFETY:
- *   - SPIN_THROTTLE = 150 is a low spin (~7 % of full range above the
- *     48-count idle floor). Enough to confirm rotation, not enough to
- *     produce meaningful thrust.
- *   - The ARM_HOLD gives you a 3-second window to kill power if anything
- *     looks wrong (waveform, motor direction, mechanical bind).
- *   - Keep the airframe restrained. Hands clear before MOTOR_STOP ends.
+ * Per-tick choreography (10 kHz tick):
+ *   - On every 10th tick (1 kHz frame rate): set values, call
+ *     dshot_transmit(). This switches the motor pins from GPIO-LOW to
+ *     timer-driven and arms DMA.
+ *   - On the tick *after* (100 µs later, frame ~57 µs long so it's done):
+ *     call dshot_park() to flip the pins back to GPIO-LOW for the
+ *     ~900 µs inter-frame gap.
  *
  * SWD WATCH:
  *   - dshot_frames_started: should climb at ~1000/sec.
- *   - dshot_frames_skipped: should stay 0. Any non-zero means a DMA
- *     channel didn't drain in time -> event routing or trigger bug.
+ *   - dshot_frames_skipped: should stay 0.
  *   - tick_count_10khz / boot_seconds: scheduler tick.
  */
 
@@ -38,7 +37,10 @@ volatile uint32_t boot_seconds     = 0;
  * spin on every motor. */
 #define ARM_HOLD_SECONDS   (3u)
 #define ARM_HOLD_TICKS     (ARM_HOLD_SECONDS * 10000u)
-#define SPIN_THROTTLE      (150u)   /* range 48..2047; 150 is gentle */
+#define SPIN_THROTTLE      (1200u)  /* range 48..2047; 1200 ~ 56 % above
+                                     * idle. Bump higher (1600, 2000) if
+                                     * the motor/ESC combo's cogging-break
+                                     * threshold is higher. */
 
 static void ConfigureClocks(void)
 {
@@ -75,7 +77,10 @@ void TIMG0_IRQHandler(void)
             if ((tick_count_10khz % 10000u) == 0u) {
                 boot_seconds++;
             }
-            /* 10 kHz tick / 10 = 1 kHz DShot frame rate. */
+            /* 10 kHz tick / 10 = 1 kHz DShot frame rate.
+             * Frame start lands on tick%10 == 0. The very next tick
+             * (tick%10 == 1) parks the motor pins LOW so the ESC sees
+             * a clean ~940 µs LOW inter-frame gap. */
             if ((tick_count_10khz % 10u) == 0u) {
                 if (tick_count_10khz < ARM_HOLD_TICKS) {
                     dshot_set_all_motor_stop();
@@ -86,6 +91,9 @@ void TIMG0_IRQHandler(void)
                     dshot_set_value(DSHOT_MOTOR_4, SPIN_THROTTLE, false);
                 }
                 (void)dshot_transmit();
+            } else if ((tick_count_10khz % 10u) == 1u) {
+                /* Frame is ~57 µs; we're now 100 µs past frame start. */
+                dshot_park();
             }
             break;
         default:

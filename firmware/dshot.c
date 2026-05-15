@@ -2,36 +2,41 @@
  * dshot.c — DShot300 on TIMA1 (M1+M2), TIMG8 (M3), TIMA0 (M4) with DMA.
  *
  * BIT TIMING @ MCLK = 16 MHz:
- *   DShot300 nominal bit period 3.333 us. We divide TIMCLK by 1, so 1 tick
- *   = 62.5 ns. LOAD = 53 - 1 gives a 53-tick = 3.3125 us period (~0.6 %
- *   short of nominal — well inside the +/-25 % tolerance the protocol
- *   spec allows).
- *     - "1" bit  high time  ~75 % -> 40 ticks high -> CC = 53 - 40 = 13
- *     - "0" bit  high time  ~37 % -> 20 ticks high -> CC = 53 - 20 = 33
- *     - quiet                            ->        CC = 53 (high time = 0)
+ *   DShot300 nominal bit period 3.333 us. TIMCLK = MCLK / 1, so 1 tick =
+ *   62.5 ns. LOAD = 52 (53 ticks per period = 3.3125 us, ~0.6 % short of
+ *   nominal — well inside DShot's +/-25 % tolerance).
+ *     - "1" bit  ~75 % HIGH -> 40 ticks HIGH -> CC = 13
+ *     - "0" bit  ~37 % HIGH -> 20 ticks HIGH -> CC = 33
+ *     - quiet    0 % HIGH   ->                  CC = 53 (CDACT never fires)
  *
- * COUNTER MODE: down-counter. At LOAD the CCP goes high (LACT = HIGH).
- * When the counter passes CC the CCP goes low (CDACT = LOW). The CC value
- * is therefore "low duration in ticks" measured from end of period.
+ * COUNTER MODE: down-counter, LACT=CCP_HIGH at load, CDACT=CCP_LOW at
+ * compare-match. CC value is "ticks of LOW measured from end of period".
  *
  * FRAME LAYOUT: 17 entries per motor, [0..15] = bit values MSB-first,
- * [16] = quiet (CC = LOAD). The trailing quiet entry ensures the line
- * latches low at end-of-frame instead of holding the last bit's CC value.
+ * [16] = quiet. The trailing quiet entry holds the timer's CCP HIGH after
+ * the 16 data bits (because CC > LOAD => no CDACT) — between frames we
+ * rely on the GPIO-override below to actually pull the pin LOW, since the
+ * timer alone can't park a CCP low while LACT_HIGH still fires every
+ * period.
+ *
+ * INTER-FRAME IDLE: timers run forever; the motor pins are routed through
+ * IOMUX PINCM and we flip each PINCM between the timer alt-function
+ * (during the ~57 us frame) and PF=1 GPIO (between frames). The GPIO is
+ * pre-configured as output-LOW, so flipping PINCM to GPIO immediately
+ * pulls the line LOW. That gives the ESC the clean ~940 us LOW idle gap
+ * it needs to align to bit 15 of the next frame.
  *
  * EVENT FABRIC ROUTING:
- *   TIMA1 publishes Z (zero) event on chanID 1 -> DMA_CH0 (M1) + DMA_CH1 (M2)
- *   TIMG8 publishes Z (zero) event on chanID 2 -> DMA_CH2 (M3)
- *   TIMA0 publishes Z (zero) event on chanID 3 -> DMA_CH3 (M4)
+ *   TIMA1 publishes its Z event on event-fabric channel 1.
+ *   DMA's FSUB_0 subscribes to channel 1.
+ *   All 4 DMA channels trigger off FSUB_0 (DMATSEL = DMA_GENERIC_SUB0_TRIG = 1).
+ *   TIMG8 and TIMA0 don't publish — they're slaved by running on the
+ *   same MCLK with the same LOAD; few-cycle drift is harmless because
+ *   the DMA writes complete well before any timer needs the new CC.
  *
- * Each DMA channel does a 17-halfword block transfer per frame, sourced
- * from its motor's frame buffer, sinking into the timer's CC_01[ch]
- * register. The channel is re-armed by the CPU at the start of every
- * frame (dshot_transmit()).
- *
- * START SYNC: timers are enabled once at end of dshot_init() and run
- * forever. Between frames the CC value last written is the trailing
- * "quiet" entry, so all CCPs hold low. DShot doesn't require phase-locked
- * channels — bit timing on each pin is what the ESC sees.
+ * Each DMA channel does a 17-halfword SINGLE-mode transfer per frame
+ * (one halfword per timer Z event). The channel is re-armed by the CPU
+ * at the start of every frame in dshot_transmit().
  */
 
 #include <ti/devices/msp/msp.h>
@@ -44,7 +49,11 @@
 #define DSHOT_LOAD              (53u - 1u)   /* down-counter LOAD value */
 #define DSHOT_CC_BIT1           (53u - 40u)  /* CC value for "1" bit */
 #define DSHOT_CC_BIT0           (53u - 20u)  /* CC value for "0" bit */
-#define DSHOT_CC_QUIET          (53u)        /* CC = LOAD+1 keeps line low */
+#define DSHOT_CC_QUIET          (53u)        /* CC > LOAD: CDACT never fires.
+                                              * Pin would hold HIGH if timer
+                                              * drove it — we use GPIO override
+                                              * (PF=1) between frames to actually
+                                              * idle the line LOW. */
 
 /* ---- Frame buffers (one per motor, 17 halfwords) ---- */
 #define DSHOT_FRAME_LEN         (17u)
@@ -61,10 +70,28 @@ static volatile uint16_t s_frame[DSHOT_NUM_MOTORS][DSHOT_FRAME_LEN];
 #define PF_M3_TIMG8_CCP1        (4u)
 #define PF_M4_TIMA0_CCP1        (7u)
 
-/* ---- Event-fabric channel IDs (1..15) ---- */
-#define EVT_CH_TIMA1            (1u)
-#define EVT_CH_TIMG8            (2u)
-#define EVT_CH_TIMA0            (3u)
+#define PF_GPIO                 (1u)   /* PF=1 is GPIO on all four PINCMs */
+
+/* GPIOB mask for the four motor DIOs. */
+#define MOTOR_PIN_MASK          ((1u << 17) | (1u << 18) | (1u << 19) | (1u << 20))
+
+/* ---- Event-fabric channel IDs (1..15) ---- *
+ *
+ * MSPM0G3507 only exposes two external DMA trigger lines via the event
+ * fabric: DMA_GENERIC_SUB0_TRIG (=1, DMA's own FSUB_0) and
+ * DMA_GENERIC_SUB1_TRIG (=2, DMA's own FSUB_1). The timers do not have
+ * dedicated DMA-trigger entries — everything has to go through those two
+ * subscriber ports.
+ *
+ * We have three timers (TIMA1, TIMG8, TIMA0) but only two ports, so we
+ * trigger all four DMA channels from a single timer (TIMA1). The other
+ * two timers run with the same MCLK and LOAD value; they'll drift only
+ * by the few cycles between their consecutive enable writes, which is
+ * negligible compared to the 53-tick DShot bit period. The DMA writes
+ * to each timer's CC register complete within ~10 cycles of TIMA1's
+ * zero event, well before any timer needs the new value. */
+#define EVT_FABRIC_CH           (1u)            /* TIMA1 publishes here, DMA subscribes here */
+#define DMA_TRIG_SEL_SUB0       (1u)            /* DMA_GENERIC_SUB0_TRIG from mspm0g350x.h */
 
 /* ---- DMA channel assignments ---- */
 #define DMA_M1                  (0u)   /* TIMA1 -> CC_0  (Motor 1) */
@@ -74,6 +101,44 @@ static volatile uint16_t s_frame[DSHOT_NUM_MOTORS][DSHOT_FRAME_LEN];
 
 volatile uint32_t dshot_frames_started = 0;
 volatile uint32_t dshot_frames_skipped = 0;
+
+/* SWD-readable diagnostics. Pause the target via the debugger and inspect
+ * these to figure out where DShot is failing without a logic analyzer.
+ *
+ *   dbg_dmasz_after_tx[]  : DMASZ for each motor sampled at the end of
+ *                           dshot_transmit() *before* the next frame's
+ *                           re-arm. Healthy value = 0 (DMA drained 17
+ *                           halfwords). Stays at 17 = DMA never fired;
+ *                           the event-fabric route is broken.
+ *   dbg_dmasa_after_tx[]  : DMASA for each motor at the same moment.
+ *                           Healthy value = &s_frame[m][17] (one past end).
+ *                           Equal to &s_frame[m][0] = DMA never advanced.
+ *   dbg_z_seen_a1/g8/a0   : Latched RIS.Z for each timer, captured once
+ *                           per second from main loop. Non-zero = the
+ *                           timer's Z event has fired since last read,
+ *                           confirming the timer is actually counting.
+ *   dbg_active_cc_*       : Snapshot of each timer's CC_01 register so
+ *                           you can see what value the comparator is
+ *                           using. Should equal the last frame entry
+ *                           (DSHOT_CC_QUIET = 53) between frames. */
+volatile uint32_t dshot_dbg_dmasz_after_tx[DSHOT_NUM_MOTORS];
+volatile uint32_t dshot_dbg_dmasa_after_tx[DSHOT_NUM_MOTORS];
+volatile uint32_t dshot_dbg_active_cc_m1;
+volatile uint32_t dshot_dbg_active_cc_m2;
+volatile uint32_t dshot_dbg_active_cc_m3;
+volatile uint32_t dshot_dbg_active_cc_m4;
+
+/* Deeper diagnostics for routing issues. Sample every transmit. */
+volatile uint32_t dshot_dbg_tima1_ctr;       /* counter value; should change between calls */
+volatile uint32_t dshot_dbg_timg8_ctr;
+volatile uint32_t dshot_dbg_tima0_ctr;
+volatile uint32_t dshot_dbg_tima1_ctrctl;    /* EN bit at bit 0 — should read 1 if timer running */
+volatile uint32_t dshot_dbg_tima1_rise_z;    /* RIS.Z bit — should be 1 if Z fired since last read/clear */
+volatile uint32_t dshot_dbg_tima1_fpub0;     /* should read back the configured channel id (1) */
+volatile uint32_t dshot_dbg_tima1_gen_imask; /* GEN_EVENT0.IMASK — should be 1 */
+volatile uint32_t dshot_dbg_dmach0_ctl;      /* DMACTL of motor1 channel — bit1 (DMAEN) should be 1 after first frame */
+volatile uint32_t dshot_dbg_dmach0_tctl;    /* DMATCTL of motor1 channel — should be 1 (TSEL=1, TINT=external) */
+volatile uint32_t dshot_dbg_dma_fsub0;       /* DMA->FSUB_0 — should be EVT_FABRIC_CH (1). 0 = nothing subscribed */
 
 /* ---- Helpers ------------------------------------------------------- */
 
@@ -113,10 +178,38 @@ static void dshot_init_gpio(void)
         delay_cycles(POWER_STARTUP_DELAY);
     }
 
+    /* Configure the four motor DIOs as GPIO outputs, driving LOW. This is
+     * the "parked" state between DShot frames. When dshot_transmit() runs
+     * it flips each PINCM back to the timer alt-function for the ~57 µs
+     * frame, then dshot_park() flips them back here so the ESC sees a
+     * clean LOW idle gap and can lock onto the next frame's rising edge. */
+    GPIOB->DOUTCLR31_0 = MOTOR_PIN_MASK;     /* DOUT = 0 (LOW) */
+    GPIOB->DOESET31_0  = MOTOR_PIN_MASK;     /* DOE = 1 (output) */
+
+    /* Park the pins LOW immediately so they don't sit in whatever state
+     * the timer left them. */
+    IOMUX->SECCFG.PINCM[PINCM_M1] = IOMUX_PINCM_PC_CONNECTED | PF_GPIO;
+    IOMUX->SECCFG.PINCM[PINCM_M2] = IOMUX_PINCM_PC_CONNECTED | PF_GPIO;
+    IOMUX->SECCFG.PINCM[PINCM_M3] = IOMUX_PINCM_PC_CONNECTED | PF_GPIO;
+    IOMUX->SECCFG.PINCM[PINCM_M4] = IOMUX_PINCM_PC_CONNECTED | PF_GPIO;
+}
+
+static void dshot_pins_to_timer(void)
+{
     IOMUX->SECCFG.PINCM[PINCM_M1] = IOMUX_PINCM_PC_CONNECTED | PF_M1_TIMA1_CCP0;
     IOMUX->SECCFG.PINCM[PINCM_M2] = IOMUX_PINCM_PC_CONNECTED | PF_M2_TIMA1_CCP1;
     IOMUX->SECCFG.PINCM[PINCM_M3] = IOMUX_PINCM_PC_CONNECTED | PF_M3_TIMG8_CCP1;
     IOMUX->SECCFG.PINCM[PINCM_M4] = IOMUX_PINCM_PC_CONNECTED | PF_M4_TIMA0_CCP1;
+}
+
+static void dshot_pins_to_gpio_low(void)
+{
+    /* GPIO DOUT was already cleared in dshot_init_gpio and never written
+     * since, so the pin reads LOW the instant PINCM PF flips to GPIO. */
+    IOMUX->SECCFG.PINCM[PINCM_M1] = IOMUX_PINCM_PC_CONNECTED | PF_GPIO;
+    IOMUX->SECCFG.PINCM[PINCM_M2] = IOMUX_PINCM_PC_CONNECTED | PF_GPIO;
+    IOMUX->SECCFG.PINCM[PINCM_M3] = IOMUX_PINCM_PC_CONNECTED | PF_GPIO;
+    IOMUX->SECCFG.PINCM[PINCM_M4] = IOMUX_PINCM_PC_CONNECTED | PF_GPIO;
 }
 
 static void dshot_init_one_timer(GPTIMER_Regs *t,
@@ -145,55 +238,78 @@ static void dshot_init_one_timer(GPTIMER_Regs *t,
 
     /* Per-channel PWM config. enable_chN selects which CC channels we
      * configure for PWM output (Motor1 uses CC_0 on TIMA1, all others use
-     * CC_1). The unused channel on TIMA1 stays dormant. */
+     * CC_1). The unused channel on TIMA1 stays dormant.
+     *
+     * CCUPD = IMMEDIATELY: DMA writes land in the active CC register
+     * directly. ZERO_EVT (shadowed) would seem cleaner, but in practice it
+     * races with the DMA write — shadow->active happens "the TIMCLK cycle
+     * following CTR=0" while DMA arbitration takes a few cycles, so the
+     * first frame's bit 15 (MSB) lands one period late and the shadow
+     * register's reset value (undefined) bleeds in. With IMMEDIATELY, the
+     * DMA write arrives at active CC ~5-10 cycles into the new period,
+     * which is well before the counter reaches even the shortest CC value
+     * (CC=13 for a "1" bit, 39 ticks of slack). No glitch. */
+    const uint32_t ccctl =
+          GPTIMER_CCCTL_01_COC_COMPARE
+        | GPTIMER_CCCTL_01_CCUPD_IMMEDIATELY;
+    const uint32_t ccact =
+          GPTIMER_CCACT_01_LACT_CCP_HIGH
+        | GPTIMER_CCACT_01_CDACT_CCP_LOW;
+    const uint32_t octl =
+          GPTIMER_OCTL_01_CCPO_FUNCVAL
+        | GPTIMER_OCTL_01_CCPIV_LOW;
     if (enable_ch0) {
+        t->COUNTERREGS.CCCTL_01[0] = ccctl;
+        t->COUNTERREGS.CCACT_01[0] = ccact;
+        t->COUNTERREGS.OCTL_01[0]  = octl;
         t->COUNTERREGS.CC_01[0]    = DSHOT_CC_QUIET;
-        t->COUNTERREGS.CCCTL_01[0] = (GPTIMER_CCCTL_01_COC_COMPARE
-                                      | GPTIMER_CCCTL_01_CCUPD_ZERO_EVT);
-        t->COUNTERREGS.CCACT_01[0] = (GPTIMER_CCACT_01_LACT_CCP_HIGH
-                                      | GPTIMER_CCACT_01_CDACT_CCP_LOW);
-        t->COUNTERREGS.OCTL_01[0]  = (GPTIMER_OCTL_01_CCPO_FUNCVAL
-                                      | GPTIMER_OCTL_01_CCPIV_LOW);
     }
     if (enable_ch1) {
+        t->COUNTERREGS.CCCTL_01[1] = ccctl;
+        t->COUNTERREGS.CCACT_01[1] = ccact;
+        t->COUNTERREGS.OCTL_01[1]  = octl;
         t->COUNTERREGS.CC_01[1]    = DSHOT_CC_QUIET;
-        t->COUNTERREGS.CCCTL_01[1] = (GPTIMER_CCCTL_01_COC_COMPARE
-                                      | GPTIMER_CCCTL_01_CCUPD_ZERO_EVT);
-        t->COUNTERREGS.CCACT_01[1] = (GPTIMER_CCACT_01_LACT_CCP_HIGH
-                                      | GPTIMER_CCACT_01_CDACT_CCP_LOW);
-        t->COUNTERREGS.OCTL_01[1]  = (GPTIMER_OCTL_01_CCPO_FUNCVAL
-                                      | GPTIMER_OCTL_01_CCPIV_LOW);
     }
 
     /* Publish the zero-event onto the chosen event-fabric channel so the
-     * DMA channels can subscribe. */
-    t->GEN_EVENT0.IMASK = GPTIMER_GEN_EVENT0_IMASK_Z_SET;
-    t->FPUB_0           = (pub_chan_id & GPTIMER_FPUB_0_CHANID_MASK);
+     * DMA's FSUB_0 can subscribe. pub_chan_id == 0 means "do not publish"
+     * — we only publish from TIMA1 since that's the single trigger source
+     * for all 4 DMA channels. */
+    if (pub_chan_id != 0u) {
+        t->GEN_EVENT0.IMASK = GPTIMER_GEN_EVENT0_IMASK_Z_SET;
+        t->FPUB_0           = (pub_chan_id & GPTIMER_FPUB_0_CHANID_MASK);
+    }
 }
 
 static void dshot_init_dma_channel(uint32_t ch,
                                    const volatile uint16_t *src,
-                                   volatile uint32_t *dst,
-                                   uint32_t event_chan_id)
+                                   volatile uint32_t *dst)
 {
     /* DMA module has no GPRCM — it is always-on. */
     DMA->DMACHAN[ch].DMASA  = (uint32_t)src;
     DMA->DMACHAN[ch].DMADA  = (uint32_t)dst;
     DMA->DMACHAN[ch].DMASZ  = 0;  /* set per-frame in dshot_transmit() */
 
-    /* Block transfer: one trigger pulls the entire 17-halfword frame.
+    /* Single transfer: each trigger moves one halfword. The timer's zero
+     * event triggers the channel once per bit period, so the 17-halfword
+     * frame takes 17 timer periods to drain. BLOCK mode would burst all
+     * 17 writes into the same CC register in a few cycles (DST is fixed)
+     * — only the last value would survive, and no bit pattern reaches
+     * the pin.
      * Source: 16-bit halfword, increment by +1 element per transfer.
      * Destination: 32-bit word write to CC register, address fixed. */
     DMA->DMACHAN[ch].DMACTL =
-          DMA_DMACTL_DMATM_BLOCK
+          DMA_DMACTL_DMATM_SINGLE
         | DMA_DMACTL_DMASRCWDTH_HALF
         | DMA_DMACTL_DMADSTWDTH_WORD
         | DMA_DMACTL_DMASRCINCR_INCREMENT
         | DMA_DMACTL_DMADSTINCR_UNCHANGED;
 
-    /* Subscribe this channel to the timer's published event channel.
-     * DMATINT_EXTERNAL = 0 selects the event-fabric path. */
-    DMA->DMATRIG[ch].DMATCTL = (event_chan_id & DMA_DMATCTL_DMATSEL_MASK)
+    /* Trigger from DMA's FSUB_0 line (see DMA_GENERIC_SUB0_TRIG in the
+     * device header). DMATINT_EXTERNAL = 0 selects the external-trigger
+     * path. The actual fabric-channel ID is configured globally via
+     * DMA->FSUB_0 in dshot_init(). */
+    DMA->DMATRIG[ch].DMATCTL = DMA_TRIG_SEL_SUB0
                              | DMA_DMATCTL_DMATINT_EXTERNAL;
 }
 
@@ -205,22 +321,35 @@ void dshot_init(void)
 
     dshot_init_gpio();
 
-    /* Order: configure timers first (publishers), then DMA (subscribers),
-     * then enable timer counters. */
-    dshot_init_one_timer(TIMA1, /*ch0*/1, /*ch1*/1, EVT_CH_TIMA1);
-    dshot_init_one_timer(TIMG8, /*ch0*/0, /*ch1*/1, EVT_CH_TIMG8);
-    dshot_init_one_timer(TIMA0, /*ch0*/0, /*ch1*/1, EVT_CH_TIMA0);
+    /* Wire the DMA peripheral's FSUB_0 subscriber port to event-fabric
+     * channel EVT_FABRIC_CH. This is the missing global config step — every
+     * DMA-channel-level DMATCTL=1 (DMA_GENERIC_SUB0_TRIG) refers to *this*
+     * line, which is meaningless until FSUB_0 has a channel ID. */
+    DMA->FSUB_0 = EVT_FABRIC_CH;
 
+    /* Configure timers. Only TIMA1 publishes its Z event onto the fabric —
+     * TIMG8 and TIMA0 just need to run with the same period; their Z events
+     * are unused. */
+    dshot_init_one_timer(TIMA1, /*ch0*/1, /*ch1*/1, /*pub*/EVT_FABRIC_CH);
+    dshot_init_one_timer(TIMG8, /*ch0*/0, /*ch1*/1, /*pub*/0u);
+    dshot_init_one_timer(TIMA0, /*ch0*/0, /*ch1*/1, /*pub*/0u);
+
+    /* All four DMA channels trigger off the same line (DMA->FSUB_0) and so
+     * fire simultaneously on each TIMA1 zero event. Each channel still has
+     * its own source buffer and destination CC register. */
     dshot_init_dma_channel(DMA_M1, s_frame[DSHOT_MOTOR_1],
-                           &TIMA1->COUNTERREGS.CC_01[0], EVT_CH_TIMA1);
+                           &TIMA1->COUNTERREGS.CC_01[0]);
     dshot_init_dma_channel(DMA_M2, s_frame[DSHOT_MOTOR_2],
-                           &TIMA1->COUNTERREGS.CC_01[1], EVT_CH_TIMA1);
+                           &TIMA1->COUNTERREGS.CC_01[1]);
     dshot_init_dma_channel(DMA_M3, s_frame[DSHOT_MOTOR_3],
-                           &TIMG8->COUNTERREGS.CC_01[1], EVT_CH_TIMG8);
+                           &TIMG8->COUNTERREGS.CC_01[1]);
     dshot_init_dma_channel(DMA_M4, s_frame[DSHOT_MOTOR_4],
-                           &TIMA0->COUNTERREGS.CC_01[1], EVT_CH_TIMA0);
+                           &TIMA0->COUNTERREGS.CC_01[1]);
 
-    /* Enable counters. CCs already pre-loaded to QUIET so outputs idle low. */
+    /* Enable counters back-to-back. Small (~few-cycle) skew between them
+     * is fine: the DMA writes are triggered only by TIMA1's Z and complete
+     * within ~10 cycles, before any timer needs the new CC value for the
+     * next period. */
     TIMA1->COUNTERREGS.CTRCTL |= GPTIMER_CTRCTL_EN_ENABLED;
     TIMG8->COUNTERREGS.CTRCTL |= GPTIMER_CTRCTL_EN_ENABLED;
     TIMA0->COUNTERREGS.CTRCTL |= GPTIMER_CTRCTL_EN_ENABLED;
@@ -245,6 +374,31 @@ void dshot_set_all_motor_stop(void)
 
 bool dshot_transmit(void)
 {
+    /* Snapshot DMA state from the previous frame for SWD inspection.
+     * Healthy values: DMASZ == 0, DMASA == &s_frame[m][17]. */
+    dshot_dbg_dmasz_after_tx[DSHOT_MOTOR_1] = DMA->DMACHAN[DMA_M1].DMASZ;
+    dshot_dbg_dmasz_after_tx[DSHOT_MOTOR_2] = DMA->DMACHAN[DMA_M2].DMASZ;
+    dshot_dbg_dmasz_after_tx[DSHOT_MOTOR_3] = DMA->DMACHAN[DMA_M3].DMASZ;
+    dshot_dbg_dmasz_after_tx[DSHOT_MOTOR_4] = DMA->DMACHAN[DMA_M4].DMASZ;
+    dshot_dbg_dmasa_after_tx[DSHOT_MOTOR_1] = DMA->DMACHAN[DMA_M1].DMASA;
+    dshot_dbg_dmasa_after_tx[DSHOT_MOTOR_2] = DMA->DMACHAN[DMA_M2].DMASA;
+    dshot_dbg_dmasa_after_tx[DSHOT_MOTOR_3] = DMA->DMACHAN[DMA_M3].DMASA;
+    dshot_dbg_dmasa_after_tx[DSHOT_MOTOR_4] = DMA->DMACHAN[DMA_M4].DMASA;
+    dshot_dbg_active_cc_m1 = TIMA1->COUNTERREGS.CC_01[0];
+    dshot_dbg_active_cc_m2 = TIMA1->COUNTERREGS.CC_01[1];
+    dshot_dbg_active_cc_m3 = TIMG8->COUNTERREGS.CC_01[1];
+    dshot_dbg_active_cc_m4 = TIMA0->COUNTERREGS.CC_01[1];
+    dshot_dbg_tima1_ctr       = TIMA1->COUNTERREGS.CTR;
+    dshot_dbg_timg8_ctr       = TIMG8->COUNTERREGS.CTR;
+    dshot_dbg_tima0_ctr       = TIMA0->COUNTERREGS.CTR;
+    dshot_dbg_tima1_ctrctl    = TIMA1->COUNTERREGS.CTRCTL;
+    dshot_dbg_tima1_rise_z    = TIMA1->GEN_EVENT0.RIS;
+    dshot_dbg_tima1_fpub0     = TIMA1->FPUB_0;
+    dshot_dbg_tima1_gen_imask = TIMA1->GEN_EVENT0.IMASK;
+    dshot_dbg_dmach0_ctl      = DMA->DMACHAN[DMA_M1].DMACTL;
+    dshot_dbg_dmach0_tctl     = DMA->DMATRIG[DMA_M1].DMATCTL;
+    dshot_dbg_dma_fsub0       = DMA->FSUB_0;
+
     /* If any channel still has DMASZ != 0 the previous frame is mid-flight.
      * Skip rather than corrupt timing. */
     if (DMA->DMACHAN[DMA_M1].DMASZ != 0
@@ -272,6 +426,36 @@ bool dshot_transmit(void)
     DMA->DMACHAN[DMA_M3].DMACTL |= DMA_DMACTL_DMAEN_ENABLE;
     DMA->DMACHAN[DMA_M4].DMACTL |= DMA_DMACTL_DMAEN_ENABLE;
 
+    /* Sync the PINCM flip to a TIMA1 zero event so the line's first
+     * rising edge after the LOW idle gap lands exactly at the start of
+     * a bit period. Without this, the flip happens at a random point in
+     * the 53-tick period; the leading-edge-to-falling-edge HIGH stretch
+     * the ESC sees for bit 15 is then anywhere from 0 to ~5 µs and
+     * intolerant decoders mis-decode the MSB.
+     *
+     * Worst-case spin: 3.3 µs (one full period). The 10 kHz scheduler
+     * tick gives us 100 µs, so this is ~3 % of the budget.
+     *
+     * We clear RIS.Z first so we wait for a *new* zero event, not a
+     * stale latched one. RIS bits aren't auto-cleared on read. */
+    TIMA1->GEN_EVENT0.ICLR = GPTIMER_GEN_EVENT0_RIS_Z_SET;
+    while ((TIMA1->GEN_EVENT0.RIS
+            & GPTIMER_GEN_EVENT0_RIS_Z_MASK) == 0u) {
+        /* spin — at most 53 cycles = 3.3 µs */
+    }
+
+    /* Counter has just reloaded to LOAD; we're at the very top of a
+     * fresh period. Flip the pins now — the timer is about to drive its
+     * CCP outputs HIGH (LACT) for the start of this period. The first
+     * DMA write (bit 15) lands within ~5 cycles, well before the
+     * earliest CDACT (39 cycles into the period for a "1" bit). */
+    dshot_pins_to_timer();
+
     dshot_frames_started++;
     return true;
+}
+
+void dshot_park(void)
+{
+    dshot_pins_to_gpio_low();
 }
