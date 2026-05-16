@@ -140,6 +140,23 @@ volatile uint32_t dshot_dbg_dmach0_ctl;      /* DMACTL of motor1 channel — bit
 volatile uint32_t dshot_dbg_dmach0_tctl;    /* DMATCTL of motor1 channel — should be 1 (TSEL=1, TINT=external) */
 volatile uint32_t dshot_dbg_dma_fsub0;       /* DMA->FSUB_0 — should be EVT_FABRIC_CH (1). 0 = nothing subscribed */
 
+/* CCPD readback for each of the 3 timers. After dshot_init() these must show
+ * the CCP channels we use configured as OUTPUT (else the timer's compare
+ * logic runs internally but never drives the pad).
+ *   TIMA1: CC0+CC1 both OUTPUT → CCPD = 0x3
+ *   TIMG8: CC1 OUTPUT          → CCPD = 0x2
+ *   TIMA0: CC1 OUTPUT          → CCPD = 0x2
+ * Reset value is 0x0 (all INPUT) — that's the silent bug this readback
+ * exists to catch. */
+volatile uint32_t dshot_dbg_tima1_ccpd;
+volatile uint32_t dshot_dbg_timg8_ccpd;
+volatile uint32_t dshot_dbg_tima0_ccpd;
+
+/* Counts of bit-15 sync outcomes inside dshot_transmit(). If frames are
+ * being lost to the DMA-enable/Z race, dshot_align_misses will be > 0. */
+volatile uint32_t dshot_align_locked;
+volatile uint32_t dshot_align_misses;
+
 /* ---- Helpers ------------------------------------------------------- */
 
 static uint16_t dshot_pack_frame(uint16_t value, bool telem_request)
@@ -271,6 +288,22 @@ static void dshot_init_one_timer(GPTIMER_Regs *t,
         t->COUNTERREGS.CC_01[1]    = DSHOT_CC_QUIET;
     }
 
+    /* CCPD = OUTPUT for the channels we use. Reset value of CCPD is 0 =
+     * INPUT for every CCPx, which leaves the timer's compare logic running
+     * internally but the pad UNDRIVEN even after CCCTL=COMPARE and the
+     * PINCM alt-function is selected. No waveform reaches the ESC. This
+     * is the missing step that SysConfig-generated PWM init always does
+     * (DL_Timer_setCCPDirection in ti_msp_dl_config.c) and the reason
+     * the pin-walk test (GPIO mode, PF=1) passes while every DShot
+     * decode attempt fails — the pad-driver test never exercises the
+     * timer alt-function path. */
+    {
+        uint32_t ccpd = t->COMMONREGS.CCPD;
+        if (enable_ch0) ccpd |= GPTIMER_CCPD_C0CCP0_OUTPUT;
+        if (enable_ch1) ccpd |= GPTIMER_CCPD_C0CCP1_OUTPUT;
+        t->COMMONREGS.CCPD = ccpd;
+    }
+
     /* Publish the zero-event onto the chosen event-fabric channel so the
      * DMA's FSUB_0 can subscribe. pub_chan_id == 0 means "do not publish"
      * — we only publish from TIMA1 since that's the single trigger source
@@ -353,6 +386,14 @@ void dshot_init(void)
     TIMA1->COUNTERREGS.CTRCTL |= GPTIMER_CTRCTL_EN_ENABLED;
     TIMG8->COUNTERREGS.CTRCTL |= GPTIMER_CTRCTL_EN_ENABLED;
     TIMA0->COUNTERREGS.CTRCTL |= GPTIMER_CTRCTL_EN_ENABLED;
+
+    /* Latch CCPD state for SWD verification. If any of these reads back as
+     * 0 (or missing the expected output-bit for the channel we use), the
+     * timer is computing compare events internally but the CCPx pad is
+     * still configured as an input and nothing reaches the ESC. */
+    dshot_dbg_tima1_ccpd = TIMA1->COMMONREGS.CCPD;
+    dshot_dbg_timg8_ccpd = TIMG8->COMMONREGS.CCPD;
+    dshot_dbg_tima0_ccpd = TIMA0->COMMONREGS.CCPD;
 }
 
 void dshot_set_value(dshot_motor_t m, uint16_t value, bool telem_request)
@@ -421,34 +462,70 @@ bool dshot_transmit(void)
     DMA->DMACHAN[DMA_M3].DMASZ = DSHOT_FRAME_LEN;
     DMA->DMACHAN[DMA_M4].DMASZ = DSHOT_FRAME_LEN;
 
+    /* Two-stage Z sync to lock bit 15 cleanly.
+     *
+     * Naive ordering (enable DMA → clear RIS.Z → wait) has a ~5-cycle race
+     * window between "DMA enable" and "RIS.Z clear" in which a Z pulse can
+     * fire the DMA *before* the CPU is ready: the DMA quietly consumes
+     * bit 15, the CPU clears the stale flag, then the wait latches on
+     * what is really bit 14's Z. The pin flip lands at the start of
+     * bit 14 — bit 15 is dropped, CRC fails, every frame is rejected.
+     *
+     * Race-free pattern:
+     *   1. Wait for a Z. Now the counter has just reloaded to LOAD and we
+     *      have ~53 cycles (~3.3 µs) of guaranteed quiet before the next Z.
+     *   2. In that gap: ack the Z, enable DMA. DMA is now armed but no Z
+     *      edge has fired yet, so it hasn't started transferring.
+     *   3. Wait again. The *next* Z that latches RIS.Z is the same Z that
+     *      fires DMA's first transfer (bit 15 → CC). CPU and DMA are now
+     *      synchronized to the same Z event.
+     *   4. Flip pins right then. Counter is at LOAD - few cycles, CC was
+     *      just written with bit 15's value, LACT has driven the timer's
+     *      internal CCPO state HIGH for this period — pin instantly rises.
+     *
+     * Worst-case total spin: ~2 × 3.3 µs = 6.6 µs (still <10 % of the
+     * 100 µs scheduler-tick budget). */
+    TIMA1->GEN_EVENT0.ICLR = GPTIMER_GEN_EVENT0_RIS_Z_SET;
+    while ((TIMA1->GEN_EVENT0.RIS
+            & GPTIMER_GEN_EVENT0_RIS_Z_MASK) == 0u) {
+        /* stage 1: sync CPU to a Z event */
+    }
+
+    /* Acknowledge stage-1 Z and arm DMA inside the post-Z quiet window. */
+    TIMA1->GEN_EVENT0.ICLR = GPTIMER_GEN_EVENT0_RIS_Z_SET;
     DMA->DMACHAN[DMA_M1].DMACTL |= DMA_DMACTL_DMAEN_ENABLE;
     DMA->DMACHAN[DMA_M2].DMACTL |= DMA_DMACTL_DMAEN_ENABLE;
     DMA->DMACHAN[DMA_M3].DMACTL |= DMA_DMACTL_DMAEN_ENABLE;
     DMA->DMACHAN[DMA_M4].DMACTL |= DMA_DMACTL_DMAEN_ENABLE;
 
-    /* Sync the PINCM flip to a TIMA1 zero event so the line's first
-     * rising edge after the LOW idle gap lands exactly at the start of
-     * a bit period. Without this, the flip happens at a random point in
-     * the 53-tick period; the leading-edge-to-falling-edge HIGH stretch
-     * the ESC sees for bit 15 is then anywhere from 0 to ~5 µs and
-     * intolerant decoders mis-decode the MSB.
-     *
-     * Worst-case spin: 3.3 µs (one full period). The 10 kHz scheduler
-     * tick gives us 100 µs, so this is ~3 % of the budget.
-     *
-     * We clear RIS.Z first so we wait for a *new* zero event, not a
-     * stale latched one. RIS bits aren't auto-cleared on read. */
-    TIMA1->GEN_EVENT0.ICLR = GPTIMER_GEN_EVENT0_RIS_Z_SET;
-    while ((TIMA1->GEN_EVENT0.RIS
-            & GPTIMER_GEN_EVENT0_RIS_Z_MASK) == 0u) {
-        /* spin — at most 53 cycles = 3.3 µs */
+    /* Stage 2: wait for the bit-15 Z. This is guaranteed to be the same Z
+     * the DMA fires on, since we armed DMA before any Z could pulse.
+     * Guard count covers many Z periods at MCLK=16 MHz — if it ever expires
+     * the timer is not running (or not publishing Z) and the frame is
+     * counted as a miss so the next tick can retry instead of corrupting
+     * the line. Cancel the staged transfers in that case so a delayed Z
+     * pulse can't fire DMA with stale data behind the CPU's back. */
+    {
+        uint32_t guard = 200u;
+        while ((TIMA1->GEN_EVENT0.RIS
+                & GPTIMER_GEN_EVENT0_RIS_Z_MASK) == 0u) {
+            if (--guard == 0u) {
+                DMA->DMACHAN[DMA_M1].DMASZ = 0;
+                DMA->DMACHAN[DMA_M2].DMASZ = 0;
+                DMA->DMACHAN[DMA_M3].DMASZ = 0;
+                DMA->DMACHAN[DMA_M4].DMASZ = 0;
+                dshot_align_misses++;
+                return false;
+            }
+        }
     }
+    dshot_align_locked++;
 
-    /* Counter has just reloaded to LOAD; we're at the very top of a
-     * fresh period. Flip the pins now — the timer is about to drive its
-     * CCP outputs HIGH (LACT) for the start of this period. The first
-     * DMA write (bit 15) lands within ~5 cycles, well before the
-     * earliest CDACT (39 cycles into the period for a "1" bit). */
+    /* Counter has just reloaded to LOAD; we're at the very top of bit 15's
+     * period. Flip pins now — the timer just drove its CCP outputs HIGH
+     * (LACT) for this period and the DMA write of bit 15 has landed in CC
+     * (a few cycles ago at most). First rising edge the ESC sees is the
+     * true start of bit 15. */
     dshot_pins_to_timer();
 
     /* Block here until the DMA has streamed all 17 CC values onto the wire
