@@ -451,6 +451,26 @@ bool dshot_transmit(void)
      * earliest CDACT (39 cycles into the period for a "1" bit). */
     dshot_pins_to_timer();
 
+    /* Block here until the DMA has streamed all 17 CC values onto the wire
+     * (~56 us = 17 bit periods), then immediately park the pins LOW. This
+     * ends the frame with a clean falling edge right after bit 0, instead
+     * of leaving the timer's quiet-period HIGH on the line for ~43 us until
+     * the next scheduler tick. A trailing HIGH that long is not valid DShot
+     * idle and can stop BLHeli_S from locking onto / auto-detecting the
+     * protocol. The wait fits inside the caller's 100 us tick budget; the
+     * guard count is a generous fallback in case the DMA never completes. */
+    {
+        uint32_t guard = 20000u;
+        while (((DMA->DMACHAN[DMA_M1].DMASZ
+               | DMA->DMACHAN[DMA_M2].DMASZ
+               | DMA->DMACHAN[DMA_M3].DMASZ
+               | DMA->DMACHAN[DMA_M4].DMASZ) != 0u)
+               && (--guard != 0u)) {
+            /* spin */
+        }
+    }
+    dshot_pins_to_gpio_low();
+
     dshot_frames_started++;
     return true;
 }

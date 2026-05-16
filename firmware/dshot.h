@@ -51,21 +51,21 @@ void dshot_set_value(dshot_motor_t m, uint16_t value, bool telem_request);
 /* Convenience: stage MOTOR_STOP (cmd 0) on all four motors. */
 void dshot_set_all_motor_stop(void);
 
-/* Kick off transmission of the staged frames on all four motors.
- * Call from a periodic task at 1..8 kHz. Returns false if a previous frame
- * is still in flight (DMA not done yet) — in that case the caller should
- * skip and try again next tick.
+/* Transmit the staged frames on all four motors. Call from a periodic task
+ * at 1..8 kHz. Returns false only if a previous frame was somehow still in
+ * flight at entry.
  *
- * Internally this flips the four motor pins from GPIO-output-LOW back to
- * timer-driven before arming the DMA, so the ESC sees a rising edge at
- * frame start instead of staying HIGH the whole inter-frame gap. */
+ * This BLOCKS for the duration of the frame (~56 us): it flips the motor
+ * pins from GPIO-output-LOW to timer-driven, waits for the DMA to stream
+ * the whole frame, then parks the pins back LOW — so the line ends the
+ * frame with a clean falling edge (valid DShot idle). Because it self-parks,
+ * a separate dshot_park() call afterwards is no longer required. */
 bool dshot_transmit(void);
 
-/* Park the motor pins LOW between frames. Call from the scheduler tick
- * *after* dshot_transmit() — typically 100 µs later for the existing
- * 10 kHz / 1 kHz-frame layout. Switches each PINCM back to GPIO so the
- * line idles LOW for the remaining ~900 µs of inter-frame gap (the ESC's
- * frame-alignment cue). */
+/* Park the motor pins LOW. dshot_transmit() now self-parks at the end of
+ * every frame, so this is retained only as an explicit-idle helper (e.g.
+ * to force the lines LOW before the scheduler starts). Calling it on the
+ * tick after dshot_transmit() is harmless but redundant. */
 void dshot_park(void);
 
 /* Diagnostics for SWD. Read these over the debugger to verify activity. */
